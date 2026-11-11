@@ -1,2 +1,3 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Fine riga Unix per script e configurazioni (evita problemi nei container su Windows)
+* text=auto eol=lf
+*.gz binary

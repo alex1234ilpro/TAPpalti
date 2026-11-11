@@ -1,0 +1,209 @@
+# TAPpalti - monitoraggio in streaming degli appalti pubblici (progetto TAP, UniCT)
+#
+# Avvio:        docker compose up -d --build
+# Training:     docker compose --profile training run --rm spark-trainer   (una volta, prima dello stream)
+# Stop:         docker compose stop          (mantiene tutto)
+# Reset totale: docker compose down -v       (cancella topic, checkpoint e indici; il modello in ./models resta)
+
+name: tappalti
+
+services:
+
+  # ---------------------------------------------------------------- SORGENTE
+  replay:
+    build: ./ingestion
+    container_name: replay
+    environment:
+      RAW_GLOB: /data/raw/2025*.jsonl*
+      OUTPUT: /stream/appalti.ndjson
+      EVENTI_AL_SECONDO: "20"
+      FILTRO_REGIONE: ""        # es. SICILIA per limitare il replay a una regione
+      FILTRO_ENTE: ""           # es. ACI CASTELLO
+      DATA_DA: ""               # es. 2025-03-01
+      MAX_GARE: "0"             # 0 = tutte
+    volumes:
+      - ./data/raw:/data/raw:ro
+      - stream:/stream
+    networks: [tap]
+
+  # ---------------------------------------------------------------- INGESTION
+  fluent-bit:
+    image: fluent/fluent-bit:3.1.9
+    container_name: fluent-bit
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - stream:/stream
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: on-failure
+    networks: [tap]
+
+  # ---------------------------------------------------------------- STREAMING
+  kafka:
+    image: apache/kafka:4.1.0
+    container_name: kafka
+    ports:
+      - "9094:9094"             # accesso dal PC: localhost:9094
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+    networks: [tap]
+
+  kafka-init:
+    image: apache/kafka:4.1.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
+      --create --if-not-exists --topic appalti --partitions 3 --replication-factor 1
+    networks: [tap]
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: tappalti
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [tap]
+
+  # ---------------------------------------------------------------- PROCESSING
+  spark-processor:
+    build: ./spark
+    image: tappalti-spark
+    container_name: spark-processor
+    user: root
+    environment:
+      ES_SINK: connector        # metti "bulk" se il connettore elasticsearch-spark da' errori
+    command: >
+      /opt/spark/bin/spark-submit
+      --master local[*]
+      --driver-memory 2g
+      --conf spark.jars.ivy=/state/ivy
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.3,org.elasticsearch:elasticsearch-spark-30_2.12:8.13.4
+      /opt/tappalti/spark/processor.py
+    ports:
+      - "4040:4040"             # Spark UI
+    volumes:
+      - ./spark:/opt/tappalti/spark:ro
+      - ./models:/opt/tappalti/models
+      - spark_state:/state
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      setup-elasticsearch:
+        condition: service_completed_successfully
+    restart: on-failure
+    networks: [tap]
+
+  # Addestramento del modello: parte solo con --profile training
+  spark-trainer:
+    build: ./spark
+    image: tappalti-spark
+    container_name: spark-trainer
+    user: root
+    profiles: [training]
+    environment:
+      TRAIN_GLOB: /data/raw/2024*.jsonl*
+      TRAIN_OUT: /state/training/appalti_train.ndjson
+      MAX_TRAIN: "200000"
+    command: >
+      bash -c "python3 /opt/tappalti/ingestion/prepare_training.py &&
+      /opt/spark/bin/spark-submit --master local[*] --driver-memory 3g /opt/tappalti/spark/train_model.py"
+    volumes:
+      - ./data/raw:/data/raw:ro
+      - ./ingestion:/opt/tappalti/ingestion:ro
+      - ./spark:/opt/tappalti/spark:ro
+      - ./models:/opt/tappalti/models
+      - spark_state:/state
+    networks: [tap]
+
+  # ---------------------------------------------------------------- INDEXING
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false      # solo sviluppo: niente utenti/password
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    networks: [tap]
+
+  setup-elasticsearch:
+    image: python:3.11-slim
+    container_name: setup-elasticsearch
+    command: python -u /setup/setup.py elasticsearch
+    volumes:
+      - ./setup:/setup:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks: [tap]
+
+  # ---------------------------------------------------------------- VISUALIZATION
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks: [tap]
+
+  setup-kibana:
+    image: python:3.11-slim
+    container_name: setup-kibana
+    command: python -u /setup/setup.py kibana
+    volumes:
+      - ./setup:/setup:ro
+    depends_on:
+      - kibana
+    networks: [tap]
+
+volumes:
+  stream:        # file NDJSON condiviso tra replay e Fluent Bit (+ stato di entrambi)
+  spark_state:   # checkpoint di Spark, cache dei pacchetti Maven, dati di training
+  es_data:       # dati di Elasticsearch
+
+networks:
+  tap:
+    name: tappalti
+    driver: bridge

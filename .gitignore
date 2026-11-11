@@ -1,0 +1,11 @@
+# dati scaricati e generati
+data/raw/*
+!data/raw/.gitkeep
+models/*
+!models/.gitkeep
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+.venv/
+!models/metriche.json
